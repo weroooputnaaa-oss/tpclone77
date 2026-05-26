@@ -1,14 +1,14 @@
 --[[
     instant tp to best
-    discord.gg/rNvAU6cjVB
-    from @spotless
+    discord.gg/77scriptz
+    from @WERO 
 ]]
 
 repeat task.wait() until game.Players.LocalPlayer
 repeat task.wait() until game:IsLoaded()
 
-wait(.2)
-setfpscap(200)
+wait(.05)
+setfpscap(400)
 
 local SERVICES = {
     Players           = game:GetService("Players"),
@@ -19,16 +19,20 @@ local SERVICES = {
 }
 
 local CONFIG = {
-    SIMULATION_RADIUS_VALUE = 1e9,
-    SPAM_TOTAL_DURATION = 3.05,
-    BAT_CYCLES_PER_FRAME = 15.333333333333333,
-    CLONE_APPEAR_GRACE_PERIOD = 0.08,           -- Reducido de 0.2
-    CLONE_TARGET_Y_OFFSET = 2.0,
-    TARGET_REFRESH_INTERVAL = 0.07,             -- Reducido de 0.15 (más rápido)
-    TARGET_STALE_GRACE_PERIOD = 0.4,
-    AUTOCLONE_RESPAWN_DELAY = 0.6,              -- Reducido de 1.0
-    BEST_PET_SEARCH_OWN_PLOT_SKIP = true,
-    AUTOCLONE_FILE = "autoclone_state.txt",
+    SIMULATION_RADIUS_VALUE        = 1e9,
+    SPAM_TOTAL_DURATION            = 3.05,
+    BAT_CYCLES_PER_FRAME           = 15.333333333333333,
+    USE_ACTIVATE_INSTEAD_OF_REMOTE = false,
+    PREFER_REMOTE_NAME             = "UseItem",
+    CLONE_APPEAR_GRACE_PERIOD      = 0.2,
+    CLONE_TARGET_Y_OFFSET          = 2.0,
+    TARGET_REFRESH_INTERVAL        = 0.15,
+    TARGET_STALE_GRACE_PERIOD      = 0.75,
+    TARGET_REUSE_DISTANCE          = 12,
+    ROOT_WAIT_TIMEOUT              = 8,
+    BEST_PET_SEARCH_OWN_PLOT_SKIP  = true,
+    AUTOCLONE_FILE                 = "autoclone_state.txt",
+    AUTOCLONE_RESPAWN_DELAY        = 1.0,
 }
 
 local STATE = {
@@ -273,59 +277,29 @@ local function moveCloneToTarget(cloneModel, targetPos)
     if not cloneModel or not targetPos then return end
     local hrp = cloneModel:FindFirstChild("HumanoidRootPart")
     if not hrp then return end
-
     pcall(function()
-        local targetCFrame = CFrame.new(targetPos + Vector3.new(0, CONFIG.CLONE_TARGET_Y_OFFSET, 0)) * hrp.CFrame.Rotation
-        
-        hrp.CFrame = targetCFrame
-        hrp.AssemblyLinearVelocity = Vector3.zero
+        cloneModel:PivotTo(
+            CFrame.new(targetPos + Vector3.new(0, CONFIG.CLONE_TARGET_Y_OFFSET, 0))
+            * cloneModel:GetPivot().Rotation
+        )
+        hrp.AssemblyLinearVelocity  = Vector3.zero
         hrp.AssemblyAngularVelocity = Vector3.zero
-        hrp.Velocity = Vector3.zero
     end)
 end
 
 -- Clone loop
 local function startCloneLoop(cloneModel)
-    if STATE.tpConn then STATE.tpConn:Disconnect() end
+    if STATE.tpConn then
+        STATE.tpConn:Disconnect()
+        STATE.tpConn = nil
+    end
 
-    STATE.tpConn = SERVICES.RunService.Heartbeat:Connect(function()
-        if not cloneModel or not cloneModel.Parent then
-            if STATE.tpConn then STATE.tpConn:Disconnect() end
-            STATE.tpConn = nil
-            STATE.cloneModel = nil
-            stopTargetWorker()
-            return
-        end
-
-        local hr = cloneModel:FindFirstChild("HumanoidRootPart")
-        if not hr then return end
-
-        if STATE.teleportActive then
-            local pos = STATE.targetCache.pos
-            if pos then
-                moveCloneToTarget(cloneModel, pos)
-
-                -- TP Inmediato + Fire Cloner si está cerca
-                if not STATE.clonerFired then
-                    local dist = (hr.Position - pos).Magnitude
-                    if dist < 18 then
-                        STATE.clonerFired = true
-                        task.spawn(function()
-                            local qc = getTool(player.Character, "Quantum Cloner")
-                            if qc then
-                                qc.Parent = player.Character
-                                task.wait(0.05)
-                                pcall(function()
-                                    if TeleportRemote then TeleportRemote:FireServer() end
-                                end)
-                            end
-                        end)
-                    end
-                end
-            end
-        end
-    end)
-end
+    local hum = cloneModel:FindFirstChild("Humanoid")
+    if hum then
+        task.spawn(function()
+            pcall(function() hum:ChangeState(Enum.HumanoidStateType.Ragdoll) end)
+        end)
+    end
 
     STATE.tpConn = SERVICES.RunService.Heartbeat:Connect(function()
         if not cloneModel or not cloneModel.Parent then
@@ -432,20 +406,33 @@ local function attachClone(child)
     STATE.spamRunning = false
     STATE.clonerFired = false
 
-    task.wait(CONFIG.CLONE_APPEAR_GRACE_PERIOD) -- Ahora solo 0.08s
+    task.wait(CONFIG.CLONE_APPEAR_GRACE_PERIOD)
 
-    local cloneRoot = child:WaitForChild("HumanoidRootPart", 8)
-    if not cloneRoot then return end
+    local ok, cloneRoot = pcall(function()
+        return child:WaitForChild("HumanoidRootPart", CONFIG.ROOT_WAIT_TIMEOUT)
+    end)
+    if not ok or not cloneRoot then warn("[ClonePanel] Clone has no HumanoidRootPart") return end
 
+    if STATE.cloneConn then STATE.cloneConn:Disconnect(); STATE.cloneConn = nil end
     STATE.cloneModel = child
 
-    -- === TP INMEDIATO AL SPAWNEAR ===
-    if STATE.autoTpActive or STATE.teleportActive then
-        STATE.teleportActive = true
-        startTargetWorker()           -- Asegurar que esté corriendo
-        task.wait(0.03)               -- Pequeña espera para que cachee objetivo
-        moveCloneToTarget(child, STATE.targetCache.pos) -- Primer TP fuerte
+    local char = player.Character
+    local bat  = getTool(char, "Bat")
+    if bat then
+        bat.Parent = char
+        bat.Parent = child
+        bat.Parent = player.Backpack
+        bat.Parent = child
     end
+
+    task.wait(0.05)
+
+    if STATE.autoTpActive or STATE.onCloneReady then
+        STATE.teleportActive = true
+        if STATE.onCloneReady then STATE.onCloneReady() end
+    end
+
+    if STATE.teleportActive then startTargetWorker() end
 
     startCloneLoop(child)
 end
@@ -546,7 +533,7 @@ screenGui.Parent         = player.PlayerGui
 -- Shadow
 local shadow = Instance.new("Frame")
 shadow.Size                   = UDim2.new(0, PANEL_W + 14, 0, PANEL_H + 14)
-shadow.Position               = UDim2.new(0, 23, 0.5, -(PANEL_H / 2) - 7)
+shadow.Position = UDim2.new(0.5, -((PANEL_W + 14) / 2), 0, 23)
 shadow.BackgroundColor3       = Color3.fromRGB(0, 10, 30)
 shadow.BackgroundTransparency = 0.45
 shadow.BorderSizePixel        = 0
@@ -558,7 +545,7 @@ Instance.new("UICorner", shadow).CornerRadius = UDim.new(0, CORNER + 4)
 local panel = Instance.new("Frame")
 panel.Name             = "Panel"
 panel.Size             = UDim2.new(0, PANEL_W, 0, PANEL_H)
-panel.Position         = UDim2.new(0, 30, 0.5, -(PANEL_H / 2))
+panel.Position = UDim2.new(0.5, -(PANEL_W / 2), 0, 30)
 panel.BackgroundColor3 = Color3.fromRGB(8, 12, 28)
 panel.BorderSizePixel  = 0
 panel.ZIndex           = 2
@@ -603,12 +590,27 @@ titleStroke.Parent       = titleBar
 local titleLabel = Instance.new("TextLabel")
 titleLabel.Size                   = UDim2.new(1, 0, 1, 0)
 titleLabel.BackgroundTransparency = 1
-titleLabel.Text                   = "⚡ discord.gg/77scriptz"
+titleLabel.Text                   = "⚡ DISCORD.GG/77SCRIPTZ"
 titleLabel.Font                   = Enum.Font.GothamBold
 titleLabel.TextSize               = 14
 titleLabel.TextColor3             = Color3.fromRGB(200, 220, 255)
 titleLabel.ZIndex                 = 4
 titleLabel.Parent                 = titleBar
+
+-- Minimize Button
+local minimized = false
+local savedSize = panel.Size
+
+local minimizeBtn = Instance.new("TextButton")
+minimizeBtn.Size = UDim2.new(0, 28, 0, 28)
+minimizeBtn.Position = UDim2.new(1, -34, 0, 3)
+minimizeBtn.BackgroundTransparency = 1
+minimizeBtn.Text = "—"
+minimizeBtn.Font = Enum.Font.GothamBold
+minimizeBtn.TextSize = 22
+minimizeBtn.TextColor3 = Color3.fromRGB(220, 235, 255)
+minimizeBtn.ZIndex = 5
+minimizeBtn.Parent = titleBar
 
 -- Drag
 do
@@ -642,6 +644,55 @@ do
         end
     end)
 end
+
+-- Minimize Logic
+local minimizedFolder = workspace:FindFirstChild("77ScriptzGuiState")
+
+if not minimizedFolder then
+    minimizedFolder = Instance.new("Folder")
+    minimizedFolder.Name = "77ScriptzGuiState"
+    minimizedFolder.Parent = workspace
+end
+
+local minimizedValue = minimizedFolder:FindFirstChild("Minimized")
+
+if not minimizedValue then
+    minimizedValue = Instance.new("BoolValue")
+    minimizedValue.Name = "Minimized"
+    minimizedValue.Value = false
+    minimizedValue.Parent = minimizedFolder
+end
+
+local function setMinimized(state)
+    minimized = state
+    minimizedValue.Value = state
+
+    if state then
+        panel.Size = UDim2.new(0, PANEL_W, 0, 34)
+        shadow.Size = UDim2.new(0, PANEL_W + 14, 0, 48)
+
+        btnAutoTp.Visible = false
+        btnTp.Visible = false
+
+        minimizeBtn.Text = "+"
+    else
+        panel.Size = savedSize
+        shadow.Size = UDim2.new(0, PANEL_W + 14, 0, PANEL_H + 14)
+
+        btnAutoTp.Visible = true
+        btnTp.Visible = true
+
+        minimizeBtn.Text = "—"
+    end
+end
+
+task.defer(function()
+    setMinimized(minimizedValue.Value)
+end)
+
+minimizeBtn.MouseButton1Click:Connect(function()
+    setMinimized(not minimized)
+end)
 
 -- Button factory
 local function createBtn(parent, yOff, icon, label, colorOff, colorOn)
