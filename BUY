@@ -1,7 +1,7 @@
 --[[
-    instant tp to best 77
-    discord.gg/77scriptz
-    from @WER0. @ENDER
+    instant tp to best
+    discord.gg/rNvAU6cjVB
+    from @spotless
 ]]
 
 repeat task.wait() until game.Players.LocalPlayer
@@ -19,20 +19,16 @@ local SERVICES = {
 }
 
 local CONFIG = {
-    SIMULATION_RADIUS_VALUE        = 1e9,
-    SPAM_TOTAL_DURATION            = 3.05,
-    BAT_CYCLES_PER_FRAME           = 15.333333333333333,
-    USE_ACTIVATE_INSTEAD_OF_REMOTE = false,
-    PREFER_REMOTE_NAME             = "UseItem",
-    CLONE_APPEAR_GRACE_PERIOD      = 0.2,
-    CLONE_TARGET_Y_OFFSET          = 2.0,
-    TARGET_REFRESH_INTERVAL        = 0.15,
-    TARGET_STALE_GRACE_PERIOD      = 0.75,
-    TARGET_REUSE_DISTANCE          = 12,
-    ROOT_WAIT_TIMEOUT              = 10,
-    BEST_PET_SEARCH_OWN_PLOT_SKIP  = true,
-    AUTOCLONE_FILE                 = "autoclone_state.txt",
-    AUTOCLONE_RESPAWN_DELAY        = 1.0,
+    SIMULATION_RADIUS_VALUE = 1e9,
+    SPAM_TOTAL_DURATION = 3.05,
+    BAT_CYCLES_PER_FRAME = 15.333333333333333,
+    CLONE_APPEAR_GRACE_PERIOD = 0.08,           -- Reducido de 0.2
+    CLONE_TARGET_Y_OFFSET = 2.0,
+    TARGET_REFRESH_INTERVAL = 0.07,             -- Reducido de 0.15 (más rápido)
+    TARGET_STALE_GRACE_PERIOD = 0.4,
+    AUTOCLONE_RESPAWN_DELAY = 0.6,              -- Reducido de 1.0
+    BEST_PET_SEARCH_OWN_PLOT_SKIP = true,
+    AUTOCLONE_FILE = "autoclone_state.txt",
 }
 
 local STATE = {
@@ -277,29 +273,59 @@ local function moveCloneToTarget(cloneModel, targetPos)
     if not cloneModel or not targetPos then return end
     local hrp = cloneModel:FindFirstChild("HumanoidRootPart")
     if not hrp then return end
+
     pcall(function()
-        cloneModel:PivotTo(
-            CFrame.new(targetPos + Vector3.new(0, CONFIG.CLONE_TARGET_Y_OFFSET, 0))
-            * cloneModel:GetPivot().Rotation
-        )
-        hrp.AssemblyLinearVelocity  = Vector3.zero
+        local targetCFrame = CFrame.new(targetPos + Vector3.new(0, CONFIG.CLONE_TARGET_Y_OFFSET, 0)) * hrp.CFrame.Rotation
+        
+        hrp.CFrame = targetCFrame
+        hrp.AssemblyLinearVelocity = Vector3.zero
         hrp.AssemblyAngularVelocity = Vector3.zero
+        hrp.Velocity = Vector3.zero
     end)
 end
 
 -- Clone loop
 local function startCloneLoop(cloneModel)
-    if STATE.tpConn then
-        STATE.tpConn:Disconnect()
-        STATE.tpConn = nil
-    end
+    if STATE.tpConn then STATE.tpConn:Disconnect() end
 
-    local hum = cloneModel:FindFirstChild("Humanoid")
-    if hum then
-        task.spawn(function()
-            pcall(function() hum:ChangeState(Enum.HumanoidStateType.Ragdoll) end)
-        end)
-    end
+    STATE.tpConn = SERVICES.RunService.Heartbeat:Connect(function()
+        if not cloneModel or not cloneModel.Parent then
+            if STATE.tpConn then STATE.tpConn:Disconnect() end
+            STATE.tpConn = nil
+            STATE.cloneModel = nil
+            stopTargetWorker()
+            return
+        end
+
+        local hr = cloneModel:FindFirstChild("HumanoidRootPart")
+        if not hr then return end
+
+        if STATE.teleportActive then
+            local pos = STATE.targetCache.pos
+            if pos then
+                moveCloneToTarget(cloneModel, pos)
+
+                -- TP Inmediato + Fire Cloner si está cerca
+                if not STATE.clonerFired then
+                    local dist = (hr.Position - pos).Magnitude
+                    if dist < 18 then
+                        STATE.clonerFired = true
+                        task.spawn(function()
+                            local qc = getTool(player.Character, "Quantum Cloner")
+                            if qc then
+                                qc.Parent = player.Character
+                                task.wait(0.05)
+                                pcall(function()
+                                    if TeleportRemote then TeleportRemote:FireServer() end
+                                end)
+                            end
+                        end)
+                    end
+                end
+            end
+        end
+    end)
+end
 
     STATE.tpConn = SERVICES.RunService.Heartbeat:Connect(function()
         if not cloneModel or not cloneModel.Parent then
@@ -406,33 +432,20 @@ local function attachClone(child)
     STATE.spamRunning = false
     STATE.clonerFired = false
 
-    task.wait(CONFIG.CLONE_APPEAR_GRACE_PERIOD)
+    task.wait(CONFIG.CLONE_APPEAR_GRACE_PERIOD) -- Ahora solo 0.08s
 
-    local ok, cloneRoot = pcall(function()
-        return child:WaitForChild("HumanoidRootPart", CONFIG.ROOT_WAIT_TIMEOUT)
-    end)
-    if not ok or not cloneRoot then warn("[ClonePanel] Clone has no HumanoidRootPart") return end
+    local cloneRoot = child:WaitForChild("HumanoidRootPart", 8)
+    if not cloneRoot then return end
 
-    if STATE.cloneConn then STATE.cloneConn:Disconnect(); STATE.cloneConn = nil end
     STATE.cloneModel = child
 
-    local char = player.Character
-    local bat  = getTool(char, "Bat")
-    if bat then
-        bat.Parent = char
-        bat.Parent = child
-        bat.Parent = player.Backpack
-        bat.Parent = child
-    end
-
-    task.wait(0.05)
-
-    if STATE.autoTpActive or STATE.onCloneReady then
+    -- === TP INMEDIATO AL SPAWNEAR ===
+    if STATE.autoTpActive or STATE.teleportActive then
         STATE.teleportActive = true
-        if STATE.onCloneReady then STATE.onCloneReady() end
+        startTargetWorker()           -- Asegurar que esté corriendo
+        task.wait(0.03)               -- Pequeña espera para que cachee objetivo
+        moveCloneToTarget(child, STATE.targetCache.pos) -- Primer TP fuerte
     end
-
-    if STATE.teleportActive then startTargetWorker() end
 
     startCloneLoop(child)
 end
@@ -590,7 +603,7 @@ titleStroke.Parent       = titleBar
 local titleLabel = Instance.new("TextLabel")
 titleLabel.Size                   = UDim2.new(1, 0, 1, 0)
 titleLabel.BackgroundTransparency = 1
-titleLabel.Text                   = "⚡ 77 TP"
+titleLabel.Text                   = "⚡ discord.gg/77scriptz"
 titleLabel.Font                   = Enum.Font.GothamBold
 titleLabel.TextSize               = 14
 titleLabel.TextColor3             = Color3.fromRGB(200, 220, 255)
