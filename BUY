@@ -1,0 +1,787 @@
+--[[
+    instant tp to best
+    discord.gg/rNvAU6cjVB
+    from @spotless
+]]
+
+repeat task.wait() until game.Players.LocalPlayer
+repeat task.wait() until game:IsLoaded()
+
+wait(.2)
+setfpscap(200)
+
+local SERVICES = {
+    Players           = game:GetService("Players"),
+    RunService        = game:GetService("RunService"),
+    TweenService      = game:GetService("TweenService"),
+    ReplicatedStorage = game:GetService("ReplicatedStorage"),
+    UserInputService  = game:GetService("UserInputService"),
+}
+
+local CONFIG = {
+    SIMULATION_RADIUS_VALUE        = 1e9,
+    SPAM_TOTAL_DURATION            = 3.05,
+    BAT_CYCLES_PER_FRAME           = 15.333333333333333,
+    USE_ACTIVATE_INSTEAD_OF_REMOTE = false,
+    PREFER_REMOTE_NAME             = "UseItem",
+    CLONE_APPEAR_GRACE_PERIOD      = 0.2,
+    CLONE_TARGET_Y_OFFSET          = 2.0,
+    TARGET_REFRESH_INTERVAL        = 0.15,
+    TARGET_STALE_GRACE_PERIOD      = 0.75,
+    TARGET_REUSE_DISTANCE          = 12,
+    ROOT_WAIT_TIMEOUT              = 10,
+    BEST_PET_SEARCH_OWN_PLOT_SKIP  = true,
+    AUTOCLONE_FILE                 = "autoclone_state.txt",
+    AUTOCLONE_RESPAWN_DELAY        = 1.0,
+}
+
+local STATE = {
+    spamRunning         = false,
+    spamConn            = nil,
+    spamStart           = 0,
+    cloneModel          = nil,
+    cloneConn           = nil,
+    tpConn              = nil,
+    teleportActive      = false,
+    autoTpActive        = false,
+    autoTpLoopConn      = nil,
+    targetCache         = { pos = nil, at = 0 },
+    targetWorkerRunning = false,
+    clonerFired         = false,
+    syncModule          = nil,
+    animalsModule       = nil,
+    channelCache        = {},
+    onCloneReady        = nil,
+}
+
+local player   = SERVICES.Players.LocalPlayer
+local backpack = player:WaitForChild("Backpack")
+
+-- Anti-kick
+SERVICES.RunService.Heartbeat:Connect(function()
+    local char = player.Character
+    if not char then return end
+    pcall(sethiddenproperty, player, "SimulationRadius",    CONFIG.SIMULATION_RADIUS_VALUE)
+    pcall(sethiddenproperty, player, "MaxSimulationRadius", CONFIG.SIMULATION_RADIUS_VALUE)
+    pcall(setsimulationradius, CONFIG.SIMULATION_RADIUS_VALUE, CONFIG.SIMULATION_RADIUS_VALUE)
+end)
+
+task.spawn(function()
+    while true do
+        SERVICES.RunService.Heartbeat:Wait()
+        local char = player.Character
+        if not char then continue end
+        local hum  = char:FindFirstChildOfClass("Humanoid")
+        local root = hum and hum.RootPart
+        if root then
+            pcall(sethiddenproperty, root, "PhysicsRepRootPart", nil)
+        end
+    end
+end)
+
+-- Save / Load
+local function saveState()
+    pcall(function()
+        writefile(CONFIG.AUTOCLONE_FILE, STATE.autoTpActive and "1" or "0")
+    end)
+end
+
+local function loadState()
+    local ok, data = pcall(readfile, CONFIG.AUTOCLONE_FILE)
+    if ok and data then
+        STATE.autoTpActive = (data:match("^%s*(.-)%s*$") == "1")
+    end
+end
+
+loadState()
+
+local function getTool(char, name)
+    return backpack:FindFirstChild(name) or (char and char:FindFirstChild(name))
+end
+
+local function activateTool(tool)
+    if CONFIG.USE_ACTIVATE_INSTEAD_OF_REMOTE then tool:Activate() return end
+    local remote = tool:FindFirstChild(CONFIG.PREFER_REMOTE_NAME)
+    if remote and remote:IsA("RemoteEvent") then
+        remote:FireServer()
+    elseif remote and remote:IsA("RemoteFunction") then
+        pcall(remote.InvokeServer, remote)
+    else
+        tool:Activate()
+    end
+end
+
+-- Quantum Cloner Remote
+local TeleportRemote = nil
+pcall(function()
+    local Packages = SERVICES.ReplicatedStorage:FindFirstChild("Packages")
+    local Net = Packages and Packages:FindFirstChild("Net")
+    if Net then
+        local NetCloneQC = Net:Clone()
+        NetCloneQC.Parent = SERVICES.ReplicatedStorage
+        local NetQC = require(NetCloneQC)
+        local function GetRemoteQC(oldName, remoteType)
+            local success, result = xpcall(function()
+                local remoteName
+                if remoteType == "FireServer" then
+                    remoteName = NetQC:RemoteEvent(oldName)
+                elseif remoteType == "InvokeServer" then
+                    remoteName = NetQC:RemoteFunction(oldName)
+                else return nil end
+                return Packages.Net:FindFirstChild(tostring(remoteName))
+            end, function() return nil end)
+            if success then return result end
+            return nil
+        end
+        TeleportRemote = GetRemoteQC("QuantumCloner/OnTeleport", "FireServer")
+    end
+end)
+
+-- Modules
+local function getModules()
+    if STATE.syncModule and STATE.animalsModule then
+        return STATE.syncModule, STATE.animalsModule
+    end
+    if _G.MorangueteHubShared and _G.MorangueteHubShared.getModules then
+        STATE.syncModule, STATE.animalsModule = _G.MorangueteHubShared.getModules()
+        return STATE.syncModule, STATE.animalsModule
+    end
+    local pkgs   = SERVICES.ReplicatedStorage:FindFirstChild("Packages")
+    local shared = SERVICES.ReplicatedStorage:FindFirstChild("Shared")
+    if pkgs   then local s = pkgs:FindFirstChild("Synchronizer");  if s then STATE.syncModule    = require(s) end end
+    if shared then local a = shared:FindFirstChild("Animals");      if a then STATE.animalsModule = require(a) end end
+    return STATE.syncModule, STATE.animalsModule
+end
+
+local function getChannel(name)
+    local cache = STATE.channelCache
+    if cache[name] and cache[name].Parent then return cache[name] end
+    cache[name] = nil
+    local sync = getModules()
+    if not sync then return nil end
+    local all = sync:GetAllChannels()
+    local ch  = (all and all[name]) or sync:Create(nil, name, nil)
+    if ch then cache[name] = ch end
+    return ch
+end
+
+local function waitChannel(name, timeout)
+    local ch = getChannel(name)
+    if ch then return ch end
+    local t = tick()
+    repeat task.wait(0.1); ch = getChannel(name) until ch or tick() - t > (timeout or 10)
+    return ch
+end
+
+-- Best Pet
+local function parseGen(v)
+    if type(v) == "number" then return v end
+    if type(v) ~= "string" then return 0 end
+    v = v:gsub("%s+", ""):upper()
+    local n, s = v:match("([%d%.]+)([KMBTQ]?)")
+    if not n then return 0 end
+    local mult = ({ K=1e3, M=1e6, B=1e9, T=1e12, Q=1e15 })[s] or 1
+    return (tonumber(n) or 0) * mult
+end
+
+local function getMyPlotName()
+    local plots = workspace:FindFirstChild("Plots")
+    if not plots then return nil end
+    for _, plot in ipairs(plots:GetChildren()) do
+        local sign  = plot:FindFirstChild("PlotSign")
+        local label = sign and sign:FindFirstChildWhichIsA("TextLabel", true)
+        if label then
+            local t = label.Text:lower()
+            if t:find(player.DisplayName:lower()) or t:find(player.Name:lower()) then
+                return plot.Name
+            end
+        end
+    end
+end
+
+local function getPartPos(model)
+    if not model then return nil end
+    local p = model.PrimaryPart or model:FindFirstChildWhichIsA("BasePart")
+    return p and p.Position
+end
+
+local function findBestPetPosition()
+    local sync, animals = getModules()
+    if not sync or not animals then return nil end
+
+    local steal = _G.MorangueteHubSelectedBrainrot
+    if not steal and _G.MorangueteHubStealNearest then
+        local t = _G.MorangueteHubStealNearest.currentBestPet
+        if type(t) == "table" and t.PlotName and t.PodiumID then steal = t end
+    end
+
+    if steal and steal.PlotName and steal.PodiumID then
+        local plots = workspace:FindFirstChild("Plots")
+        local plot  = plots and plots:FindFirstChild(steal.PlotName)
+        local ch    = plot and waitChannel(plot.Name)
+        if ch then
+            local entry = (ch:Get("AnimalList") or {})[steal.PodiumID]
+            if type(entry) == "table" and not entry.Machine and entry.Index then
+                return getPartPos(plot:FindFirstChild(entry.Index))
+            end
+        end
+        return nil
+    end
+
+    local plots  = workspace:FindFirstChild("Plots")
+    if not plots then return nil end
+    local myPlot = CONFIG.BEST_PET_SEARCH_OWN_PLOT_SKIP and getMyPlotName()
+    local minGen = parseGen((_G.MorangueteHubConfig and _G.MorangueteHubConfig.Get
+        and _G.MorangueteHubConfig.Get("esp.esp brainrots.min gen", nil)) or 0)
+    local bestGen, bestPos = -1e9, nil
+
+    for _, plot in ipairs(plots:GetChildren()) do
+        if plot.Name == myPlot or not plot:GetAttribute("Tier") then continue end
+        local ch = waitChannel(plot.Name)
+        if not ch then continue end
+        for _, entry in pairs(ch:Get("AnimalList") or {}) do
+            if type(entry) == "table" and not entry.Machine and entry.Index then
+                local gen = animals:GetGeneration(entry.Index, entry.Mutation, entry.Traits)
+                if gen >= minGen and gen > bestGen then
+                    local pos = getPartPos(plot:FindFirstChild(entry.Index))
+                    if pos then bestGen, bestPos = gen, pos end
+                end
+            end
+        end
+    end
+    return bestPos
+end
+
+-- Target Worker
+local function startTargetWorker()
+    if STATE.targetWorkerRunning then return end
+    STATE.targetWorkerRunning = true
+    task.spawn(function()
+        while STATE.targetWorkerRunning do
+            local pos = findBestPetPosition()
+            if pos then
+                STATE.targetCache.pos = pos
+                STATE.targetCache.at  = tick()
+            end
+            task.wait(CONFIG.TARGET_REFRESH_INTERVAL)
+        end
+    end)
+end
+
+local function stopTargetWorker()
+    STATE.targetWorkerRunning = false
+end
+
+-- Clone movement
+local function moveCloneToTarget(cloneModel, targetPos)
+    if not cloneModel or not targetPos then return end
+    local hrp = cloneModel:FindFirstChild("HumanoidRootPart")
+    if not hrp then return end
+    pcall(function()
+        cloneModel:PivotTo(
+            CFrame.new(targetPos + Vector3.new(0, CONFIG.CLONE_TARGET_Y_OFFSET, 0))
+            * cloneModel:GetPivot().Rotation
+        )
+        hrp.AssemblyLinearVelocity  = Vector3.zero
+        hrp.AssemblyAngularVelocity = Vector3.zero
+    end)
+end
+
+-- Clone loop
+local function startCloneLoop(cloneModel)
+    if STATE.tpConn then
+        STATE.tpConn:Disconnect()
+        STATE.tpConn = nil
+    end
+
+    local hum = cloneModel:FindFirstChild("Humanoid")
+    if hum then
+        task.spawn(function()
+            pcall(function() hum:ChangeState(Enum.HumanoidStateType.Ragdoll) end)
+        end)
+    end
+
+    STATE.tpConn = SERVICES.RunService.Heartbeat:Connect(function()
+        if not cloneModel or not cloneModel.Parent then
+            STATE.tpConn:Disconnect()
+            STATE.tpConn     = nil
+            STATE.cloneModel = nil
+            stopTargetWorker()
+            return
+        end
+        local hr = cloneModel:FindFirstChild("HumanoidRootPart")
+        if not hr then
+            STATE.tpConn:Disconnect()
+            STATE.tpConn     = nil
+            STATE.cloneModel = nil
+            stopTargetWorker()
+            return
+        end
+        if STATE.teleportActive then
+            local pos = STATE.targetCache.pos
+            if pos then
+                moveCloneToTarget(cloneModel, pos)
+                if not STATE.clonerFired then
+                    local dist = (hr.Position - pos).Magnitude
+                    local isOwner = true
+                    if isnetworkowner then
+                        local ok, res = pcall(isnetworkowner, cloneModel.PrimaryPart or hr)
+                        if ok then isOwner = res end
+                    end
+                    if dist < 15 and isOwner then
+                        STATE.clonerFired = true
+                        task.spawn(function()
+                            local char = player.Character
+                            if char then
+                                local qc = getTool(char, "Quantum Cloner")
+                                if qc then
+                                    qc.Parent = char
+                                    task.wait(CONFIG.CLONE_APPEAR_GRACE_PERIOD)
+                                    pcall(function()
+                                        if TeleportRemote then TeleportRemote:FireServer() end
+                                    end)
+                                end
+                            end
+                        end)
+                    end
+                end
+            end
+        else
+            pcall(function()
+                hr.AssemblyLinearVelocity  = Vector3.zero
+                hr.AssemblyAngularVelocity = Vector3.zero
+            end)
+        end
+    end)
+end
+
+-- Spam
+local function startSpam()
+    if STATE.spamRunning then return end
+    STATE.spamRunning = true
+    STATE.spamStart   = tick()
+
+    STATE.spamConn = SERVICES.RunService.Heartbeat:Connect(function()
+        if not STATE.spamRunning then
+            if STATE.spamConn then STATE.spamConn:Disconnect(); STATE.spamConn = nil end
+            return
+        end
+        local char = player.Character
+        if not char then return end
+        if STATE.cloneModel and STATE.cloneModel.Parent then
+            STATE.spamRunning = false
+            STATE.spamConn:Disconnect(); STATE.spamConn = nil
+            return
+        end
+        if tick() - STATE.spamStart >= CONFIG.SPAM_TOTAL_DURATION then
+            STATE.spamRunning = false
+            STATE.spamConn:Disconnect(); STATE.spamConn = nil
+            return
+        end
+        local bat = getTool(char, "Bat")
+        if not bat then
+            STATE.spamRunning = false
+            STATE.spamConn:Disconnect(); STATE.spamConn = nil
+            return
+        end
+        local qc = getTool(char, "Quantum Cloner")
+        if qc then
+            qc.Parent = char
+            activateTool(qc)
+            qc.Parent = backpack
+        end
+        for _ = 1, CONFIG.BAT_CYCLES_PER_FRAME do
+            bat.Parent = char
+            bat.Parent = backpack
+        end
+    end)
+end
+
+-- Detect clone
+local expectedName = ("%s_Clone"):format(player.UserId)
+
+local function listenForClone() end -- forward declare
+
+local function attachClone(child)
+    STATE.spamRunning = false
+    STATE.clonerFired = false
+
+    task.wait(CONFIG.CLONE_APPEAR_GRACE_PERIOD)
+
+    local ok, cloneRoot = pcall(function()
+        return child:WaitForChild("HumanoidRootPart", CONFIG.ROOT_WAIT_TIMEOUT)
+    end)
+    if not ok or not cloneRoot then warn("[ClonePanel] Clone has no HumanoidRootPart") return end
+
+    if STATE.cloneConn then STATE.cloneConn:Disconnect(); STATE.cloneConn = nil end
+    STATE.cloneModel = child
+
+    local char = player.Character
+    local bat  = getTool(char, "Bat")
+    if bat then
+        bat.Parent = char
+        bat.Parent = child
+        bat.Parent = player.Backpack
+        bat.Parent = child
+    end
+
+    task.wait(0.05)
+
+    if STATE.autoTpActive or STATE.onCloneReady then
+        STATE.teleportActive = true
+        if STATE.onCloneReady then STATE.onCloneReady() end
+    end
+
+    if STATE.teleportActive then startTargetWorker() end
+
+    startCloneLoop(child)
+end
+
+listenForClone = function()
+    if STATE.cloneConn then STATE.cloneConn:Disconnect() end
+    STATE.cloneConn = workspace.ChildAdded:Connect(function(child)
+        if child.Name ~= expectedName then return end
+        task.spawn(attachClone, child)
+    end)
+end
+
+listenForClone()
+
+-- Auto TP loop
+local function startAutoTpLoop()
+    if STATE.autoTpLoopConn then return end
+    STATE.autoTpLoopConn = SERVICES.RunService.Heartbeat:Connect(function()
+        if not STATE.autoTpActive then
+            STATE.autoTpLoopConn:Disconnect()
+            STATE.autoTpLoopConn = nil
+            return
+        end
+        if (not STATE.cloneModel or not STATE.cloneModel.Parent) and not STATE.spamRunning then
+            STATE.cloneModel = nil
+            listenForClone()
+            task.delay(CONFIG.AUTOCLONE_RESPAWN_DELAY, function()
+                if STATE.autoTpActive and not STATE.cloneModel and not STATE.spamRunning then
+                    startSpam()
+                end
+            end)
+            task.wait(CONFIG.AUTOCLONE_RESPAWN_DELAY + CONFIG.SPAM_TOTAL_DURATION + 1)
+        end
+    end)
+end
+
+-- One-time TP function (mirrors Auto TP exactly, no loop)
+local function runTpOnce()
+    STATE.teleportActive = false
+    STATE.clonerFired    = false
+
+    if not STATE.cloneModel or not STATE.cloneModel.Parent then
+        -- No clone yet — spawn one, then activate TP once it's ready
+        STATE.cloneModel = nil
+
+        STATE.onCloneReady = function()
+            STATE.teleportActive = true
+            STATE.onCloneReady   = nil
+        end
+
+        listenForClone()
+        startSpam()
+    else
+        -- Clone already exists — activate TP immediately, fire one instant move,
+        -- then keep the loop running so it holds position
+        STATE.teleportActive = true
+        STATE.onCloneReady   = nil
+
+        startTargetWorker()
+
+        -- Kick off an immediate TP attempt without waiting for the first Heartbeat
+        task.spawn(function()
+            -- Give the target worker one tick to populate the cache if it's cold
+            if not STATE.targetCache.pos then
+                task.wait(CONFIG.TARGET_REFRESH_INTERVAL)
+            end
+            local pos = STATE.targetCache.pos
+            if pos and STATE.cloneModel and STATE.cloneModel.Parent then
+                moveCloneToTarget(STATE.cloneModel, pos)
+            end
+        end)
+
+        startCloneLoop(STATE.cloneModel)
+    end
+end
+
+-- ─────────────────────────────────────────────────────────────────────────────
+-- GUI
+-- ─────────────────────────────────────────────────────────────────────────────
+local PANEL_W  = 210
+local PANEL_H  = 160
+local CORNER   = 12
+local BTN_H    = 48
+local BTN_GAP  = 10
+local PAD      = 14
+
+local function makeTween(obj, info, props)
+    return SERVICES.TweenService:Create(obj, info, props)
+end
+
+local screenGui = Instance.new("ScreenGui")
+screenGui.Name           = "ClonePanelGui"
+screenGui.ResetOnSpawn   = false
+screenGui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
+screenGui.IgnoreGuiInset = true
+screenGui.Parent         = player.PlayerGui
+
+-- Shadow
+local shadow = Instance.new("Frame")
+shadow.Size                   = UDim2.new(0, PANEL_W + 14, 0, PANEL_H + 14)
+shadow.Position               = UDim2.new(0, 23, 0.5, -(PANEL_H / 2) - 7)
+shadow.BackgroundColor3       = Color3.fromRGB(0, 10, 30)
+shadow.BackgroundTransparency = 0.45
+shadow.BorderSizePixel        = 0
+shadow.ZIndex                 = 1
+shadow.Parent                 = screenGui
+Instance.new("UICorner", shadow).CornerRadius = UDim.new(0, CORNER + 4)
+
+-- Panel
+local panel = Instance.new("Frame")
+panel.Name             = "Panel"
+panel.Size             = UDim2.new(0, PANEL_W, 0, PANEL_H)
+panel.Position         = UDim2.new(0, 30, 0.5, -(PANEL_H / 2))
+panel.BackgroundColor3 = Color3.fromRGB(8, 12, 28)
+panel.BorderSizePixel  = 0
+panel.ZIndex           = 2
+panel.Active           = true
+panel.Parent           = screenGui
+Instance.new("UICorner", panel).CornerRadius = UDim.new(0, CORNER)
+
+local grad = Instance.new("UIGradient")
+grad.Color = ColorSequence.new({
+    ColorSequenceKeypoint.new(0, Color3.fromRGB(14, 20, 50)),
+    ColorSequenceKeypoint.new(1, Color3.fromRGB(6,  10, 22)),
+})
+grad.Rotation = 120
+grad.Parent = panel
+
+local stroke = Instance.new("UIStroke")
+stroke.Color        = Color3.fromRGB(40, 100, 220)
+stroke.Thickness    = 1.5
+stroke.Transparency = 0.3
+stroke.Parent       = panel
+
+-- Title bar
+local titleBar = Instance.new("Frame")
+titleBar.Size                   = UDim2.new(1, 0, 0, 34)
+titleBar.Position               = UDim2.new(0, 0, 0, 0)
+titleBar.BackgroundColor3       = Color3.fromRGB(18, 50, 140)
+titleBar.BackgroundTransparency = 0.05
+titleBar.BorderSizePixel        = 0
+titleBar.ZIndex                 = 3
+titleBar.Parent                 = panel
+local tc = Instance.new("UICorner")
+tc.CornerRadius = UDim.new(0, CORNER)
+tc.Parent = titleBar
+
+
+local titleStroke = Instance.new("UIStroke")
+titleStroke.Color        = Color3.fromRGB(30, 80, 200)
+titleStroke.Transparency = 0.3
+titleStroke.Thickness    = 1.5
+titleStroke.Parent       = titleBar
+
+local titleLabel = Instance.new("TextLabel")
+titleLabel.Size                   = UDim2.new(1, 0, 1, 0)
+titleLabel.BackgroundTransparency = 1
+titleLabel.Text                   = "⚡ 77 TP"
+titleLabel.Font                   = Enum.Font.GothamBold
+titleLabel.TextSize               = 14
+titleLabel.TextColor3             = Color3.fromRGB(200, 220, 255)
+titleLabel.ZIndex                 = 4
+titleLabel.Parent                 = titleBar
+
+-- Drag
+do
+    local dragging, dragStart, startPos
+    titleBar.InputBegan:Connect(function(input)
+        if input.UserInputType == Enum.UserInputType.MouseButton1
+            or input.UserInputType == Enum.UserInputType.Touch then
+            dragging  = true
+            dragStart = input.Position
+            startPos  = panel.Position
+        end
+    end)
+    titleBar.InputEnded:Connect(function(input)
+        if input.UserInputType == Enum.UserInputType.MouseButton1
+            or input.UserInputType == Enum.UserInputType.Touch then
+            dragging = false
+        end
+    end)
+    SERVICES.UserInputService.InputChanged:Connect(function(input)
+        if dragging and (input.UserInputType == Enum.UserInputType.MouseMovement
+            or input.UserInputType == Enum.UserInputType.Touch) then
+            local delta = input.Position - dragStart
+            panel.Position = UDim2.new(
+                startPos.X.Scale, startPos.X.Offset + delta.X,
+                startPos.Y.Scale, startPos.Y.Offset + delta.Y
+            )
+            shadow.Position = UDim2.new(
+                startPos.X.Scale, startPos.X.Offset + delta.X - 7,
+                startPos.Y.Scale, startPos.Y.Offset + delta.Y - 7
+            )
+        end
+    end)
+end
+
+-- Button factory
+local function createBtn(parent, yOff, icon, label, colorOff, colorOn)
+    local btn = Instance.new("TextButton")
+    btn.Size             = UDim2.new(1, -(PAD * 2), 0, BTN_H)
+    btn.Position         = UDim2.new(0, PAD, 0, yOff)
+    btn.BackgroundColor3 = colorOff
+    btn.BorderSizePixel  = 0
+    btn.Text             = ""
+    btn.AutoButtonColor  = false
+    btn.ZIndex           = 3
+    btn.Parent           = parent
+    Instance.new("UICorner", btn).CornerRadius = UDim.new(0, 9)
+
+    local bStroke = Instance.new("UIStroke")
+    bStroke.Color        = Color3.fromRGB(180, 210, 255)
+    bStroke.Transparency = 0.78
+    bStroke.Thickness    = 1
+    bStroke.Parent       = btn
+
+    local bGrad = Instance.new("UIGradient")
+    bGrad.Transparency = NumberSequence.new({
+        NumberSequenceKeypoint.new(0, 0.80),
+        NumberSequenceKeypoint.new(1, 1),
+    })
+    bGrad.Rotation = 90
+    bGrad.Parent = btn
+
+    local iconL = Instance.new("TextLabel")
+    iconL.Size                   = UDim2.new(0, 34, 1, 0)
+    iconL.Position               = UDim2.new(0, 8, 0, 0)
+    iconL.BackgroundTransparency = 1
+    iconL.Text                   = icon
+    iconL.Font                   = Enum.Font.GothamBold
+    iconL.TextSize               = 20
+    iconL.TextColor3             = Color3.fromRGB(255, 255, 255)
+    iconL.ZIndex                 = 4
+    iconL.Parent                 = btn
+
+    local textL = Instance.new("TextLabel")
+    textL.Size                   = UDim2.new(1, -52, 1, 0)
+    textL.Position               = UDim2.new(0, 46, 0, 0)
+    textL.BackgroundTransparency = 1
+    textL.Text                   = label
+    textL.Font                   = Enum.Font.GothamBold
+    textL.TextSize               = 13
+    textL.TextXAlignment         = Enum.TextXAlignment.Left
+    textL.TextColor3             = Color3.fromRGB(210, 225, 255)
+    textL.ZIndex                 = 4
+    textL.Parent                 = btn
+
+    local dot = Instance.new("Frame")
+    dot.Size             = UDim2.new(0, 8, 0, 8)
+    dot.Position         = UDim2.new(1, -16, 0.5, -4)
+    dot.BackgroundColor3 = Color3.fromRGB(60, 60, 80)
+    dot.BorderSizePixel  = 0
+    dot.ZIndex           = 4
+    dot.Parent           = btn
+    Instance.new("UICorner", dot).CornerRadius = UDim.new(1, 0)
+
+    local ti = TweenInfo.new(0.12, Enum.EasingStyle.Quad)
+    btn.MouseEnter:Connect(function()
+        makeTween(btn, ti, { BackgroundTransparency = 0.18 }):Play()
+    end)
+    btn.MouseLeave:Connect(function()
+        makeTween(btn, ti, { BackgroundTransparency = 0 }):Play()
+    end)
+
+    return btn, textL, dot, colorOff, colorOn
+end
+
+local Y1 = 34 + BTN_GAP
+local Y2 = Y1 + BTN_H + BTN_GAP
+
+local COLOR_AUTOTP_OFF = Color3.fromRGB(20,  70, 180)
+local COLOR_AUTOTP_ON  = Color3.fromRGB(10, 140, 255)
+local COLOR_TP_OFF     = Color3.fromRGB(14,  50, 130)
+local COLOR_TP_ON      = Color3.fromRGB(20, 100, 200)
+
+local btnAutoTp, lblAutoTp, dotAutoTp = createBtn(panel, Y1, "🔁", "Auto TP", COLOR_AUTOTP_OFF, COLOR_AUTOTP_ON)
+local btnTp,     lblTp,     dotTp     = createBtn(panel, Y2, "🎯", "TP Once",  COLOR_TP_OFF,     COLOR_TP_ON)
+
+local function setDot(dot, active)
+    dot.BackgroundColor3 = active
+        and Color3.fromRGB(60, 180, 255)
+        or  Color3.fromRGB(60, 60, 80)
+end
+
+-- ─── Auto TP button ───────────────────────────────────────────────────────────
+btnAutoTp.MouseButton1Click:Connect(function()
+    STATE.autoTpActive = not STATE.autoTpActive
+    saveState()
+
+    setDot(dotAutoTp, STATE.autoTpActive)
+    btnAutoTp.BackgroundColor3 = STATE.autoTpActive and COLOR_AUTOTP_ON or COLOR_AUTOTP_OFF
+    lblAutoTp.Text = STATE.autoTpActive and "Auto TP: ON" or "Auto TP"
+
+    if STATE.autoTpActive then
+        STATE.teleportActive = false
+
+        STATE.onCloneReady = function()
+            STATE.teleportActive = true
+            lblAutoTp.Text = "Auto TP: ON"
+        end
+
+        startAutoTpLoop()
+
+        if not STATE.cloneModel or not STATE.cloneModel.Parent then
+            STATE.cloneModel = nil
+            listenForClone()
+            startSpam()
+            lblAutoTp.Text = "Auto TP: Spawning..."
+        end
+    else
+        STATE.onCloneReady = nil
+        STATE.teleportActive = false
+        if STATE.autoTpLoopConn then
+            STATE.autoTpLoopConn:Disconnect()
+            STATE.autoTpLoopConn = nil
+        end
+        stopTargetWorker()
+    end
+end)
+
+-- ─── TP Once button ───────────────────────────────────────────────────────────
+btnTp.MouseButton1Click:Connect(function()
+    lblTp.Text = "TP Once: Running..."
+    setDot(dotTp, true)
+    btnTp.BackgroundColor3 = COLOR_TP_ON
+
+    runTpOnce()
+
+    task.delay(CONFIG.SPAM_TOTAL_DURATION + 1.5, function()
+        lblTp.Text = "TP Once"
+        setDot(dotTp, false)
+        btnTp.BackgroundColor3 = COLOR_TP_OFF
+    end)
+end)
+
+-- Apply loaded state
+if STATE.autoTpActive then
+    setDot(dotAutoTp, true)
+    btnAutoTp.BackgroundColor3 = COLOR_AUTOTP_ON
+    lblAutoTp.Text             = "Auto TP: Spawning..."
+
+    STATE.onCloneReady = function()
+        STATE.teleportActive = true
+        lblAutoTp.Text = "Auto TP: ON"
+    end
+
+    startAutoTpLoop()
+    if not STATE.cloneModel or not STATE.cloneModel.Parent then
+        listenForClone()
+        startSpam()
+    end
+end
